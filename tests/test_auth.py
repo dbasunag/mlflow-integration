@@ -124,7 +124,7 @@ from mlflow_kubernetes_plugins.auth.authorizer import (
     KubernetesAuthorizer,
     _AuthorizationCache,
     _AuthorizationCacheKey,
-    _ImpersonatingApiClient,
+    _ImpersonatingRESTClient,
     _RulesReviewCache,
 )
 from mlflow_kubernetes_plugins.auth.collection_filters import (
@@ -166,6 +166,7 @@ from mlflow_kubernetes_plugins.auth.constants import (
     RESOURCE_MCP_SERVERS,
     RESOURCE_REGISTERED_MODELS,
     RESOURCE_SKILLS,
+    SAR_COLLECTION_SCOPE_DISCOVERY_ENABLED_ENV,
     WORKSPACES_ENABLED_ENV,
 )
 from mlflow_kubernetes_plugins.auth.core import (
@@ -476,6 +477,35 @@ def test_kubernetes_auth_config_defaults_enable_workspaces():
 
     assert config.workspaces_enabled is True
     assert config.namespace is None
+    assert config.sar_collection_scope_discovery_enabled is False
+
+
+def test_kubernetes_auth_config_reads_sar_collection_scope_discovery_enabled(monkeypatch):
+    monkeypatch.setenv(SAR_COLLECTION_SCOPE_DISCOVERY_ENABLED_ENV, "true")
+
+    config = KubernetesAuthConfig.from_env()
+
+    assert config.sar_collection_scope_discovery_enabled is True
+
+
+def test_kubernetes_auth_config_preserves_positional_argument_order():
+    config = KubernetesAuthConfig(
+        60,
+        "email",
+        AuthorizationMode.SUBJECT_ACCESS_REVIEW,
+        "x-user",
+        "x-groups",
+        ",",
+        False,
+        "team-a",
+    )
+
+    assert config.user_header == "x-user"
+    assert config.groups_header == "x-groups"
+    assert config.groups_separator == ","
+    assert config.workspaces_enabled is False
+    assert config.namespace == "team-a"
+    assert config.sar_collection_scope_discovery_enabled is False
 
 
 def test_kubernetes_auth_config_invalid_workspaces_enabled(monkeypatch):
@@ -4364,8 +4394,9 @@ def test_discover_collection_scope_accepts_explicit_wildcard(monkeypatch):
     ) == CollectionScope(broad=True)
 
 
-def test_impersonating_api_client_preserves_multiple_groups(monkeypatch):
+def test_impersonating_rest_client_preserves_multiple_groups(monkeypatch):
     from kubernetes import client
+    from kubernetes.client.rest import RESTClientObject
 
     captured = {}
 
@@ -4373,12 +4404,9 @@ def test_impersonating_api_client_preserves_multiple_groups(monkeypatch):
         captured.update(method=method, url=url, headers=kwargs["headers"])
         return None
 
-    monkeypatch.setattr(client.ApiClient, "request", request)
-    api_client = _ImpersonatingApiClient(client.Configuration(), ("team-a", "team-b"))
-    try:
-        api_client.request("POST", "/rules", headers={"Impersonate-User": "alice"})
-    finally:
-        api_client.close()
+    monkeypatch.setattr(RESTClientObject, "request", request)
+    rest_client = _ImpersonatingRESTClient(client.Configuration(), ("team-a", "team-b"))
+    rest_client.request("POST", "/rules", headers={"Impersonate-User": "alice"})
 
     assert captured["headers"].getlist("Impersonate-Group") == ["team-a", "team-b"]
     assert captured["headers"]["Impersonate-User"] == "alice"
@@ -4390,7 +4418,10 @@ def test_discover_collection_scope_in_sar_mode_uses_forwarded_identity(monkeypat
         lambda: Mock(configuration=Mock()),
     )
     authorizer = KubernetesAuthorizer(
-        KubernetesAuthConfig(authorization_mode=AuthorizationMode.SUBJECT_ACCESS_REVIEW)
+        KubernetesAuthConfig(
+            authorization_mode=AuthorizationMode.SUBJECT_ACCESS_REVIEW,
+            sar_collection_scope_discovery_enabled=True,
+        )
     )
     authorizer._submit_impersonated_subject_rules_review = Mock(  # type: ignore[method-assign]
         return_value=SimpleNamespace(
@@ -4422,9 +4453,7 @@ def test_discover_collection_scope_in_sar_mode_uses_forwarded_identity(monkeypat
     )
 
 
-def test_discover_collection_scope_in_sar_mode_denies_without_impersonation(monkeypatch):
-    from kubernetes.client.exceptions import ApiException
-
+def test_discover_collection_scope_in_sar_mode_requires_explicit_opt_in(monkeypatch):
     monkeypatch.setattr(
         "mlflow_kubernetes_plugins.auth.authorizer._create_api_client_for_subject_access_reviews",
         lambda: Mock(configuration=Mock()),
@@ -4432,18 +4461,17 @@ def test_discover_collection_scope_in_sar_mode_denies_without_impersonation(monk
     authorizer = KubernetesAuthorizer(
         KubernetesAuthConfig(authorization_mode=AuthorizationMode.SUBJECT_ACCESS_REVIEW)
     )
-    authorizer._submit_impersonated_subject_rules_review = Mock(  # type: ignore[method-assign]
-        side_effect=ApiException(status=403)
-    )
+    authorizer._submit_impersonated_subject_rules_review = Mock()  # type: ignore[method-assign]
     authorizer.is_allowed = Mock()  # type: ignore[method-assign]
 
-    with pytest.raises(MlflowException, match="Failed to discover"):
+    with pytest.raises(MlflowException, match="Named collection scopes are disabled"):
         authorizer.discover_collection_scope(
             _RequestIdentity(user="alice", groups=("team-a",)),
             RESOURCE_EXPERIMENTS,
             "team-a",
         )
     authorizer.is_allowed.assert_not_called()
+    authorizer._submit_impersonated_subject_rules_review.assert_not_called()
 
 
 def test_discover_collection_scope_rejects_incomplete_rules(monkeypatch):

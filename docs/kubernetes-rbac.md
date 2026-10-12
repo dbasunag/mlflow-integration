@@ -70,12 +70,14 @@ This is most useful for single-object operations such as:
 - reading artifacts or trace details that resolve back to one experiment
 
 Collection searches first check broad `list` permission in the workspace. An
-explicit `resourceNames: ["*"]` grant on `get` or `list` also permits the original
-query. Otherwise, the plugin discovers concrete named `get` grants through
-Kubernetes SelfSubjectRulesReview, validates each name with an access review,
-and narrows the request before MLflow queries storage. The caller's own search
-filter is combined with the authorization scope. If the installed MLflow version
-cannot enforce that scope, the plugin denies the request before dispatch.
+explicit `resourceNames: ["*"]` grant on `get` or `list` is a plugin-level
+compatibility convention and also permits the original query; Kubernetes RBAC
+does not interpret that name as a wildcard itself. Otherwise, the plugin
+discovers concrete named `get` grants through Kubernetes
+SelfSubjectRulesReview, validates each name with an access review, and narrows
+the request before MLflow queries storage. The caller's own search filter is
+combined with the authorization scope. If the installed MLflow version cannot
+enforce that scope, the plugin denies the request before dispatch.
 
 This applies to experiment, evaluation-dataset, trace, registered-model,
 model-version, MCP server, and MCP access-endpoint searches; batch trace reads;
@@ -121,6 +123,14 @@ on skills. Direct parent creation requires broad `create`.
 When `MLFLOW_K8S_AUTH_AUTHORIZATION_MODE=subject_access_review`, the MLflow server must also be allowed to create `subjectaccessreviews.authorization.k8s.io`.
 
 That permission is included in [`examples/mlflow-server-rbac.yaml`](../examples/mlflow-server-rbac.yaml).
+
+Named collection scopes are disabled by default in trusted-proxy mode because
+Kubernetes can only perform a `SelfSubjectRulesReview` for the forwarded caller
+by impersonating that caller. To enable them, set
+`MLFLOW_K8S_AUTH_SAR_COLLECTION_SCOPE_DISCOVERY_ENABLED=true` and grant the
+MLflow server's `ClusterRole` `impersonate` on core `users` and `groups`. This is
+a high-trust deployment option: the proxy must authenticate callers and strip
+any client-supplied identity headers before setting the forwarded identity.
 
 ## Token Creation
 

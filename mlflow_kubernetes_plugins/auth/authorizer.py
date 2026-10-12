@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Generic, Iterable, TypeVar
 from kubernetes import client, config
 from kubernetes.client import AuthorizationV1Api
 from kubernetes.client.exceptions import ApiException
+from kubernetes.client.rest import RESTClientObject
 from kubernetes.config.config_exception import ConfigException
 from mlflow.exceptions import MlflowException
 from mlflow.protos import databricks_pb2
@@ -33,6 +34,7 @@ from mlflow_kubernetes_plugins.auth.constants import (
     REMOTE_GROUPS_HEADER_ENV,
     REMOTE_GROUPS_SEPARATOR_ENV,
     REMOTE_USER_HEADER_ENV,
+    SAR_COLLECTION_SCOPE_DISCOVERY_ENABLED_ENV,
     USERNAME_CLAIM_ENV,
     WORKSPACE_PERMISSION_RESOURCE_PRIORITY,
     WORKSPACES_ENABLED_ENV,
@@ -212,7 +214,7 @@ def _create_api_client_for_subject_access_reviews() -> client.ApiClient:
     return client.ApiClient()
 
 
-class _ImpersonatingApiClient(client.ApiClient):
+class _ImpersonatingRESTClient(RESTClientObject):
     """Preserve repeated Impersonate-Group headers through the generated API client."""
 
     def __init__(self, configuration: client.Configuration, groups: tuple[str, ...]) -> None:
@@ -225,8 +227,8 @@ class _ImpersonatingApiClient(client.ApiClient):
         url,
         query_params=None,
         headers=None,
-        post_params=None,
         body=None,
+        post_params=None,
         _preload_content=True,
         _request_timeout=None,
     ):
@@ -255,6 +257,9 @@ class KubernetesAuthorizer:
         self._cache = _AuthorizationCache(config_values.cache_ttl_seconds)
         self._rules_cache = _RulesReviewCache(config_values.cache_ttl_seconds)
         self._mode = config_values.authorization_mode
+        self._sar_collection_scope_discovery_enabled = (
+            config_values.sar_collection_scope_discovery_enabled
+        )
         self._base_configuration: client.Configuration | None = None
         self._sar_api_client: client.ApiClient | None = None
         self._user_header_label = (
@@ -376,7 +381,8 @@ class KubernetesAuthorizer:
         body = client.V1SelfSubjectRulesReview(
             spec=client.V1SelfSubjectRulesReviewSpec(namespace=namespace)
         )
-        api_client = _ImpersonatingApiClient(self._sar_api_client.configuration, groups)
+        api_client = client.ApiClient(self._sar_api_client.configuration)
+        api_client.rest_client = _ImpersonatingRESTClient(api_client.configuration, groups)
         try:
             return AuthorizationV1Api(api_client).create_self_subject_rules_review(
                 body, _headers={"Impersonate-User": user}
@@ -396,6 +402,16 @@ class KubernetesAuthorizer:
         SSRR is only a source of candidate names. Confirm every candidate with an
         access review before it can constrain an MLflow query.
         """
+        if (
+            self._mode == AuthorizationMode.SUBJECT_ACCESS_REVIEW
+            and not self._sar_collection_scope_discovery_enabled
+        ):
+            raise MlflowException(
+                "Named collection scopes are disabled in SubjectAccessReview mode. "
+                f"Set {SAR_COLLECTION_SCOPE_DISCOVERY_ENABLED_ENV}=true only after granting "
+                "the MLflow server impersonate permission for the trusted forwarded identities.",
+                error_code=databricks_pb2.PERMISSION_DENIED,
+            )
         resource = resource_type.replace("_", "")
         requested_resource = f"{resource}/{subresource}" if subresource else resource
         cache_key = (
@@ -640,6 +656,7 @@ class KubernetesAuthConfig:
     groups_separator: str = DEFAULT_REMOTE_GROUPS_SEPARATOR
     workspaces_enabled: bool = DEFAULT_WORKSPACES_ENABLED
     namespace: str | None = None
+    sar_collection_scope_discovery_enabled: bool = False
 
     @classmethod
     def from_env(cls) -> "KubernetesAuthConfig":
@@ -657,6 +674,11 @@ class KubernetesAuthConfig:
             WORKSPACES_ENABLED_ENV,
             os.environ.get(WORKSPACES_ENABLED_ENV),
             default=DEFAULT_WORKSPACES_ENABLED,
+        )
+        sar_collection_scope_discovery_enabled = _parse_bool_env(
+            SAR_COLLECTION_SCOPE_DISCOVERY_ENABLED_ENV,
+            os.environ.get(SAR_COLLECTION_SCOPE_DISCOVERY_ENABLED_ENV),
+            default=False,
         )
         namespace = os.environ.get(NAMESPACE_ENV)
 
@@ -705,6 +727,7 @@ class KubernetesAuthConfig:
             cache_ttl_seconds=cache_ttl_seconds,
             username_claim=username_claim,
             authorization_mode=authorization_mode,
+            sar_collection_scope_discovery_enabled=sar_collection_scope_discovery_enabled,
             user_header=user_header,
             groups_header=groups_header,
             groups_separator=groups_separator or DEFAULT_REMOTE_GROUPS_SEPARATOR,
