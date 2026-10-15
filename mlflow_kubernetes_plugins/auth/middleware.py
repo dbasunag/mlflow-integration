@@ -135,7 +135,11 @@ class KubernetesAuthMiddleware(BaseHTTPMiddleware):
         raw_body = bytes(await request.body())
         state[_REQUEST_RAW_BODY_STATE_KEY] = raw_body
         try:
-            payload = json.loads(raw_body) if raw_body else None
+            payload = json.loads(raw_body) if raw_body else {}
+            # MLflow treats an absent or null JSON body as an empty object.
+            # Keep parse failures distinct so request scoping still fails closed.
+            if payload is None:
+                payload = {}
         except (UnicodeDecodeError, json.JSONDecodeError):
             payload = None
         state[_REQUEST_JSON_BODY_STATE_KEY] = payload

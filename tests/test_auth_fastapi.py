@@ -13,6 +13,7 @@ from fastapi.middleware.wsgi import WSGIMiddleware
 from fastapi.testclient import TestClient
 from flask import Flask
 from flask import request as flask_request
+from kubernetes.client.exceptions import ApiException
 from mlflow.exceptions import MlflowException
 from mlflow.protos import databricks_pb2
 from mlflow.tracing.utils.otlp import OTLP_TRACES_PATH
@@ -29,7 +30,6 @@ from mlflow_kubernetes_plugins.auth.collection_filters import (
     COLLECTION_POLICY_REQUEST_AUTHORIZED_EXPERIMENT_IDS,
     COLLECTION_POLICY_REQUEST_BATCH_GET_TRACE_INFOS,
     COLLECTION_POLICY_REQUEST_BATCH_GET_TRACES,
-    COLLECTION_POLICY_REQUEST_LIST_SCORERS,
     COLLECTION_POLICY_REQUEST_SEARCH_DATASETS,
     COLLECTION_POLICY_REQUEST_SEARCH_EXPERIMENTS,
     COLLECTION_POLICY_REQUEST_SEARCH_MCP_ACCESS_ENDPOINTS,
@@ -1055,6 +1055,62 @@ def test_fastapi_rewrites_experiment_id_sources_for_mounted_flask_app(
     assert response.json()["query_ids"] == []
 
 
+@pytest.mark.parametrize("broad_allowed", [True, False])
+@pytest.mark.parametrize("discovery_failure", [403, 503, "incomplete"])
+def test_fastapi_sar_discovery_failure_denies_only_requests_requiring_discovery(
+    monkeypatch, compile_auth_rules, broad_allowed, discovery_failure
+):
+    from mlflow.protos.service_pb2 import SearchTraces
+
+    monkeypatch.setattr(
+        "mlflow_kubernetes_plugins.auth.authorizer._create_api_client_for_subject_access_reviews",
+        Mock(),
+    )
+    config = KubernetesAuthConfig(
+        authorization_mode=AuthorizationMode.SUBJECT_ACCESS_REVIEW,
+        workspaces_enabled=False,
+        namespace="team-a",
+    )
+    app = FastAPI()
+    handler = Mock()
+
+    @app.get("/api/2.0/mlflow/traces/search")
+    async def search_traces():
+        handler()
+        return {"traces": []}
+
+    compile_auth_rules([("/api/2.0/mlflow/traces/search", SearchTraces, ["GET"])])
+    with KubernetesAuthorizer(config) as authorizer:
+        monkeypatch.setattr(authorizer, "is_allowed", Mock(return_value=broad_allowed))
+        reviews = Mock()
+        if discovery_failure == "incomplete":
+            reviews.return_value = SimpleNamespace(
+                status=SimpleNamespace(evaluation_error=None, incomplete=True, resource_rules=[])
+            )
+        else:
+            reviews.side_effect = ApiException(status=discovery_failure)
+        monkeypatch.setattr(authorizer, "_submit_impersonated_subject_rules_review", reviews)
+        app.add_middleware(KubernetesAuthMiddleware, authorizer=authorizer, config_values=config)
+        with TestClient(app) as client:
+            response = client.get(
+                "/api/2.0/mlflow/traces/search",
+                headers={
+                    DEFAULT_REMOTE_USER_HEADER: "alice",
+                    DEFAULT_REMOTE_GROUPS_HEADER: "team-a|team-b",
+                },
+            )
+
+        if broad_allowed:
+            assert response.status_code == 200
+            handler.assert_called_once_with()
+            reviews.assert_not_called()
+        else:
+            assert response.status_code == 403
+            assert response.json()["error"]["code"] == "PERMISSION_DENIED"
+            handler.assert_not_called()
+            reviews.assert_called_once_with("alice", ("team-a", "team-b"), "team-a")
+
+
 def test_fastapi_search_traces_scopes_before_handler(mock_authorizer, mock_config, monkeypatch):
     flask_app = Flask(__name__)
     app = FastAPI()
@@ -1171,10 +1227,6 @@ def test_fastapi_batch_trace_scope_reaches_handler(
         ],
     )
     monkeypatch.setattr(
-        "mlflow_kubernetes_plugins.auth.collection_filters._batch_trace_scope_supported",
-        lambda *, infos: True,
-    )
-    monkeypatch.setattr(
         "mlflow_kubernetes_plugins.auth.collection_filters.resolve_experiment_ids_from_names",
         lambda names: ("1",),
     )
@@ -1205,7 +1257,7 @@ def test_fastapi_batch_trace_scope_reaches_handler(
 
 
 def test_fastapi_list_scorers_single_and_cross_experiment_scope(
-    mock_authorizer, mock_config, monkeypatch
+    mock_authorizer, mock_config, monkeypatch, compile_auth_rules
 ):
     from mlflow.protos.service_pb2 import ListScorers
 
@@ -1234,19 +1286,10 @@ def test_fastapi_list_scorers_single_and_cross_experiment_scope(
         KubernetesAuthMiddleware, authorizer=mock_authorizer, config_values=mock_config
     )
     app.add_middleware(_WorkspaceContextMiddleware)
-    monkeypatch.setattr(
-        "mlflow_kubernetes_plugins.auth.compiler._find_authorization_rules",
-        lambda path, method, **kwargs: [
-            AuthorizationRule(
-                "list",
-                resource="experiments",
-                collection_policy=COLLECTION_POLICY_REQUEST_LIST_SCORERS,
-            )
-        ],
-    )
+    compile_auth_rules([("/api/3.0/mlflow/scorers/list", ListScorers, ["GET"])])
     monkeypatch.setattr(
         "mlflow_kubernetes_plugins.auth.collection_filters._resolve_experiment_name_from_experiment_id",
-        lambda experiment_id: "exp-a",
+        lambda experiment_id: "exp-a" if experiment_id == "1" else "exp-denied",
     )
     mock_authorizer.is_allowed.side_effect = lambda *args, **kwargs: (
         args[2] == "get" and kwargs.get("resource_name") == "exp-a"
@@ -1262,11 +1305,15 @@ def test_fastapi_list_scorers_single_and_cross_experiment_scope(
     assert single.json() == {"experiment_id": "1", "experiment_ids": []}
     handler.assert_called_once_with("1", [])
 
-    monkeypatch.setattr(
-        ListScorers,
-        "DESCRIPTOR",
-        SimpleNamespace(fields_by_name={"experiment_ids": object()}),
+    denied_single = client.get(
+        "/api/3.0/mlflow/scorers/list",
+        params={"experiment_id": "3"},
+        headers={"Authorization": "Bearer token"},
     )
+    assert denied_single.status_code == 403
+    handler.assert_called_once_with("1", [])
+    mock_authorizer.discover_collection_scope.assert_not_called()
+
     monkeypatch.setattr(
         "mlflow_kubernetes_plugins.auth.collection_filters.resolve_experiment_ids_from_names",
         lambda names: ("1", "2"),

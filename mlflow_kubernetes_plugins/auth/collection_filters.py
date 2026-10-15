@@ -2,14 +2,22 @@
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import replace
-from functools import lru_cache
 from typing import TYPE_CHECKING
 
-import sqlparse
-from sqlparse.sql import Comparison
-from sqlparse.tokens import Keyword
+from google.protobuf.json_format import ParseError
+from mlflow.protos.model_registry_pb2 import SearchModelVersions, SearchRegisteredModels
+from mlflow.protos.service_pb2 import (
+    BatchGetTraceInfos,
+    BatchGetTraces,
+    ListScorers,
+    SearchEvaluationDatasets,
+    SearchExperiments,
+    SearchTraces,
+)
+from mlflow.utils.proto_json_utils import parse_dict
 
 from mlflow_kubernetes_plugins.auth.constants import (
     RESOURCE_DATASETS,
@@ -47,6 +55,17 @@ COLLECTION_POLICY_REQUEST_LIST_SCORERS = "request_scope_list_scorers"
 COLLECTION_POLICY_REQUEST_SEARCH_DATASETS = "request_scope_search_datasets"
 COLLECTION_POLICY_REQUEST_SEARCH_MCP_SERVERS = "request_scope_search_mcp_servers"
 COLLECTION_POLICY_REQUEST_SEARCH_MCP_ACCESS_ENDPOINTS = "request_scope_search_mcp_access_endpoints"
+
+_COLLECTION_REQUEST_MESSAGES = {
+    COLLECTION_POLICY_REQUEST_AUTHORIZED_EXPERIMENT_IDS: SearchTraces,
+    COLLECTION_POLICY_REQUEST_BATCH_GET_TRACE_INFOS: BatchGetTraceInfos,
+    COLLECTION_POLICY_REQUEST_BATCH_GET_TRACES: BatchGetTraces,
+    COLLECTION_POLICY_REQUEST_LIST_SCORERS: ListScorers,
+    COLLECTION_POLICY_REQUEST_SEARCH_DATASETS: SearchEvaluationDatasets,
+    COLLECTION_POLICY_REQUEST_SEARCH_EXPERIMENTS: SearchExperiments,
+    COLLECTION_POLICY_REQUEST_SEARCH_REGISTERED_MODELS: SearchRegisteredModels,
+    COLLECTION_POLICY_REQUEST_SEARCH_MODEL_VERSIONS: SearchModelVersions,
+}
 
 _EXPERIMENT_READ_RULE = (RESOURCE_EXPERIMENTS, "get")
 
@@ -464,16 +483,6 @@ def _filter_request_authorized_experiment_ids(
     return request_context, True
 
 
-def _batch_trace_scope_supported(*, infos: bool) -> bool:
-    from mlflow.protos.service_pb2 import BatchGetTraces
-
-    from mlflow_kubernetes_plugins.auth._compat import BatchGetTraceInfos
-
-    message = BatchGetTraceInfos if infos else BatchGetTraces
-    descriptor = getattr(message, "DESCRIPTOR", None)
-    return "experiment_ids" in getattr(descriptor, "fields_by_name", {})
-
-
 def _filter_request_list_scorers(
     request_context: AuthorizationRequest,
     authorizer: "KubernetesAuthorizer",
@@ -499,14 +508,23 @@ def _filter_request_list_scorers(
     scope = authorizer.discover_collection_scope(identity, RESOURCE_EXPERIMENTS, workspace_name)
     if scope.broad:
         return request_context, True
-    from mlflow.protos.service_pb2 import ListScorers
-
-    descriptor = getattr(ListScorers, "DESCRIPTOR", None)
-    if "experiment_ids" not in getattr(descriptor, "fields_by_name", {}):
-        return request_context, False
     return _filter_request_authorized_experiment_ids(
         request_context, authorizer, identity, workspace_name, scope=scope
     )
+
+
+def _quote_filter_literal(value: str) -> str:
+    """Quote an MLflow equality value without applying Python escape sequences.
+
+    Equality strips enclosing quotes without unescaping their contents. IN lists
+    instead use Python literal decoding, so their elements must still use repr().
+    Names containing both quote delimiters cannot be represented in equality.
+    """
+    if "'" not in value:
+        return "'" + value + "'"
+    if '"' not in value:
+        return '"' + value + '"'
+    raise ValueError("Resource name contains both MLflow string quote delimiters.")
 
 
 def _filter_request_search_datasets(
@@ -525,8 +543,18 @@ def _filter_request_search_datasets(
     if method not in {"GET", "POST"} or (method == "POST" and not isinstance(body, dict)):
         return request_context, False
 
+    if method == "POST" and isinstance(body, dict) and "filterString" in body:
+        if "filter_string" in body:
+            return request_context, False
+        body = dict(body)
+        body["filter_string"] = body.pop("filterString")
+
     if len(scope.names) == 1:
-        scope_filter = f"name = {scope.names[0]!r}"
+        try:
+            quoted_name = _quote_filter_literal(scope.names[0])
+        except ValueError:
+            return request_context, False
+        scope_filter = f"name = {quoted_name}"
         comparator = "="
         expected_value: str | tuple[str, ...] = scope.names[0]
     else:
@@ -543,18 +571,8 @@ def _filter_request_search_datasets(
             return request_context, False
         if value.strip():
             caller_filters.append(value.strip())
-    if caller_filters:
-        statements = sqlparse.parse(" AND ".join(caller_filters))
-        if len(statements) != 1 or any(
-            not (
-                token.is_whitespace or isinstance(token, Comparison) or token.match(Keyword, "AND")
-            )
-            for token in statements[0].tokens
-        ):
-            return request_context, False
     narrowed_filter = " AND ".join([*caller_filters, scope_filter])
     try:
-        from mlflow.store.tracking.sqlalchemy_store import _get_search_datasets_filter_clauses
         from mlflow.utils.search_utils import SearchEvaluationDatasetsUtils
 
         parsed = SearchEvaluationDatasetsUtils.parse_search_filter(narrowed_filter)
@@ -566,12 +584,6 @@ def _filter_request_search_datasets(
         }
         if not parsed or parsed[-1] != expected_scope:
             return request_context, False
-        if comparator == "IN":
-            attribute_filters, non_attribute_filters = _get_search_datasets_filter_clauses(
-                [expected_scope], "sqlite"
-            )
-            if len(attribute_filters) != 1 or non_attribute_filters:
-                return request_context, False
     except Exception:
         return request_context, False
 
@@ -599,7 +611,11 @@ def _filter_request_search_mcp(
         return request_context, False
     key = "server_name" if access_endpoints else "name"
     if len(scope.names) == 1:
-        scope_filter = f"{key} = {scope.names[0]!r}"
+        try:
+            quoted_name = _quote_filter_literal(scope.names[0])
+        except ValueError:
+            return request_context, False
+        scope_filter = f"{key} = {quoted_name}"
         comparator = "="
         expected_value: str | tuple[str, ...] = scope.names[0]
     else:
@@ -611,15 +627,6 @@ def _filter_request_search_mcp(
     if not isinstance(existing_filter, str):
         return request_context, False
     existing_filter = existing_filter.strip()
-    if existing_filter:
-        statements = sqlparse.parse(existing_filter)
-        if len(statements) != 1 or any(
-            not (
-                token.is_whitespace or isinstance(token, Comparison) or token.match(Keyword, "AND")
-            )
-            for token in statements[0].tokens
-        ):
-            return request_context, False
     narrowed_filter = f"{existing_filter} AND {scope_filter}" if existing_filter else scope_filter
     try:
         from mlflow.utils.search_utils import SearchMCPAccessEndpointUtils, SearchMCPServerUtils
@@ -641,29 +648,6 @@ def _filter_request_search_mcp(
     ), True
 
 
-@lru_cache(maxsize=1)
-def _supports_search_experiments_id_in() -> bool:
-    """Require both the MLflow parser and SQL store to understand ID lists."""
-    try:
-        from mlflow.store.tracking.sqlalchemy_store import _get_search_experiments_filter_clauses
-        from mlflow.utils.search_utils import SearchExperimentsUtils
-
-        parsed = SearchExperimentsUtils.parse_search_filter("experiment_id IN ('1', '2')")
-        if len(parsed) != 1 or parsed[0] != {
-            "type": "attribute",
-            "key": "experiment_id",
-            "comparator": "IN",
-            "value": ("1", "2"),
-        }:
-            return False
-        attribute_filters, non_attribute_filters = _get_search_experiments_filter_clauses(
-            parsed, "sqlite"
-        )
-        return len(attribute_filters) == 1 and not non_attribute_filters
-    except Exception:
-        return False
-
-
 def _filter_request_search_experiments(
     request_context: AuthorizationRequest,
     authorizer: "KubernetesAuthorizer",
@@ -676,8 +660,12 @@ def _filter_request_search_experiments(
     if not scope.names:
         return request_context, False
     if len(scope.names) == 1:
+        try:
+            quoted_name = _quote_filter_literal(scope.names[0])
+        except ValueError:
+            return request_context, False
         # Equality is supported by released MLflow and needs no name-to-ID lookup.
-        scope_filter = f"name = {scope.names[0]!r}"
+        scope_filter = f"name = {quoted_name}"
         expected_scope = {
             "type": "attribute",
             "key": "name",
@@ -691,10 +679,8 @@ def _filter_request_search_experiments(
             return request_context, False
         # SQL-backed MLflow experiment IDs are decimal strings. Restrict the injected
         # literal grammar even though the IDs came from the tracking store.
-        if (
-            not experiment_ids
-            or any(not re.fullmatch(r"[0-9]+", value) for value in experiment_ids)
-            or not _supports_search_experiments_id_in()
+        if not experiment_ids or any(
+            not re.fullmatch(r"[0-9]+", value) for value in experiment_ids
         ):
             return request_context, False
         scope_filter = (
@@ -720,15 +706,6 @@ def _filter_request_search_experiments(
             return request_context, False
         if value.strip():
             filters.append(value.strip())
-    if filters:
-        statements = sqlparse.parse(" AND ".join(filters))
-        if len(statements) != 1 or any(
-            not (
-                token.is_whitespace or isinstance(token, Comparison) or token.match(Keyword, "AND")
-            )
-            for token in statements[0].tokens
-        ):
-            return request_context, False
     narrowed_filter = " AND ".join([*filters, scope_filter])
     try:
         from mlflow.utils.search_utils import SearchExperimentsUtils
@@ -766,7 +743,11 @@ def _filter_request_registered_model_search(
         return request_context, False
 
     if len(scope.names) == 1:
-        scope_filter = f"name = {scope.names[0]!r}"
+        try:
+            quoted_name = _quote_filter_literal(scope.names[0])
+        except ValueError:
+            return request_context, False
+        scope_filter = f"name = {quoted_name}"
         comparator = "="
         expected_value: str | tuple[str, ...] = scope.names[0]
     else:
@@ -778,15 +759,6 @@ def _filter_request_registered_model_search(
     if not isinstance(existing_filter, str):
         return request_context, False
     existing_filter = existing_filter.strip()
-    if existing_filter:
-        statements = sqlparse.parse(existing_filter)
-        if len(statements) != 1 or any(
-            not (
-                token.is_whitespace or isinstance(token, Comparison) or token.match(Keyword, "AND")
-            )
-            for token in statements[0].tokens
-        ):
-            return request_context, False
     narrowed_filter = f"{existing_filter} AND {scope_filter}" if existing_filter else scope_filter
     try:
         from mlflow.utils.search_utils import SearchModelUtils, SearchModelVersionUtils
@@ -809,6 +781,52 @@ def _filter_request_registered_model_search(
     ), True
 
 
+def _normalize_collection_request(
+    request_context: AuthorizationRequest, policy: str
+) -> tuple[AuthorizationRequest, bool]:
+    body = request_context.json_body
+    if isinstance(body, str):
+        # Match MLflow's one additional decode for legacy JSON-string bodies.
+        try:
+            body = json.loads(body)
+        except json.JSONDecodeError:
+            return request_context, False
+        if body is None:
+            body = {}
+        if not isinstance(body, dict):
+            return request_context, False
+        request_context = replace(request_context, json_body=body)
+
+    if (
+        request_context.method.upper() != "GET"
+        or request_context.query_params
+        or not isinstance(body, dict)
+    ):
+        return request_context, True
+
+    # MLflow reads a GET body only when there are no query parameters. Move
+    # its complete protobuf input to the query before adding an auth scope;
+    # handlers also inspect query presence for experiment_ids restrictions.
+    message = _COLLECTION_REQUEST_MESSAGES[policy]()
+    for field in message.DESCRIPTOR.fields:
+        if field.name != field.json_name and field.name in body and field.json_name in body:
+            return request_context, False
+    try:
+        parse_dict(body, message)
+    except (ParseError, TypeError, ValueError):
+        return request_context, False
+    query = {}
+    for field in message.DESCRIPTOR.fields:
+        if field.name in body or field.json_name in body:
+            value = getattr(message, field.name)
+            try:
+                is_repeated = field.is_repeated
+            except AttributeError:
+                is_repeated = field.label == field.LABEL_REPEATED
+            query[field.name] = list(value) if is_repeated else value
+    return replace(request_context, json_body=None, query_params=query), True
+
+
 def apply_request_collection_filter(
     request_context: AuthorizationRequest,
     policy: str | None,
@@ -823,6 +841,11 @@ def apply_request_collection_filter(
     when the filter found identifiers in the request and narrowed them to the
     subset the caller is authorized for.
     """
+    if policy in _COLLECTION_REQUEST_MESSAGES:
+        assert policy is not None
+        request_context, normalized = _normalize_collection_request(request_context, policy)
+        if not normalized:
+            return request_context, False
     if policy == COLLECTION_POLICY_REQUEST_EXPERIMENT_IDS:
         return _filter_request_experiment_ids(request_context, authorizer, identity, workspace_name)
     if policy == COLLECTION_POLICY_REQUEST_EXPERIMENT_ID:
@@ -846,10 +869,6 @@ def apply_request_collection_filter(
         scope = authorizer.discover_collection_scope(identity, RESOURCE_EXPERIMENTS, workspace_name)
         if scope.broad:
             return request_context, True
-        if not _batch_trace_scope_supported(
-            infos=policy == COLLECTION_POLICY_REQUEST_BATCH_GET_TRACE_INFOS
-        ):
-            return request_context, False
         return _filter_request_authorized_experiment_ids(
             request_context, authorizer, identity, workspace_name, scope=scope
         )

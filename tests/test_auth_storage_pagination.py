@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from unittest.mock import Mock
 
-import pytest
+from mlflow.entities.mcp_server import MCPStatus
 from mlflow.tracking import MlflowClient
 from mlflow_kubernetes_plugins.auth.authorizer import CollectionScope
 from mlflow_kubernetes_plugins.auth.collection_filters import (
@@ -32,9 +32,7 @@ def _request_context(path: str) -> AuthorizationRequest:
     )
 
 
-def _scoped_filter(
-    path: str, policy: str, allowed_names: tuple[str, ...], unsupported_message: str
-) -> str:
+def _scoped_filter(path: str, policy: str, allowed_names: tuple[str, ...]) -> str:
     authorizer = Mock()
     authorizer.discover_collection_scope.return_value = CollectionScope(names=allowed_names)
     updated, applied = apply_request_collection_filter(
@@ -44,8 +42,7 @@ def _scoped_filter(
         identity=_RequestIdentity(token="token"),
         workspace_name="team-a",
     )
-    if not applied:
-        pytest.skip(unsupported_message)
+    assert applied, "Supported MLflow must apply the named collection scope."
 
     filter_string = updated.query_params["filter_string"]
     assert isinstance(filter_string, str)
@@ -81,7 +78,6 @@ def test_search_evaluation_datasets_scoped_filter_paginates_without_underfill(tm
         "/api/3.0/mlflow/datasets/search",
         COLLECTION_POLICY_REQUEST_SEARCH_DATASETS,
         tuple(sorted(allowed_names)),
-        "Installed MLflow version cannot express a multi-name dataset scope.",
     )
     collected = _collect_paginated_names(
         lambda page_token: client.search_datasets(
@@ -110,7 +106,6 @@ def test_search_evaluation_datasets_scope_is_independent_of_experiment_associati
         "/api/3.0/mlflow/datasets/search",
         COLLECTION_POLICY_REQUEST_SEARCH_DATASETS,
         allowed_names,
-        "Installed MLflow version cannot express a multi-name dataset scope.",
     )
     page = client.search_datasets(filter_string=filter_string, max_results=10)
 
@@ -118,11 +113,6 @@ def test_search_evaluation_datasets_scope_is_independent_of_experiment_associati
 
 
 def test_search_mcp_access_endpoints_scoped_filter_paginates_without_underfill(tmp_path):
-    mcp_server = pytest.importorskip(
-        "mlflow.entities.mcp_server",
-        reason="Installed MLflow version does not expose the MCP registry API.",
-    )
-    MCPStatus = mcp_server.MCPStatus
     client = _sqlite_client(tmp_path)
 
     allowed_names: list[str] = []
@@ -142,7 +132,6 @@ def test_search_mcp_access_endpoints_scoped_filter_paginates_without_underfill(t
         "/api/3.0/mlflow/mcp-servers/endpoints",
         COLLECTION_POLICY_REQUEST_SEARCH_MCP_ACCESS_ENDPOINTS,
         tuple(sorted(allowed_names)),
-        "Installed MLflow version cannot express a multi-name MCP endpoint scope.",
     )
     collected = _collect_paginated_names(
         lambda page_token: client.search_mcp_access_endpoints(

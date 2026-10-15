@@ -555,6 +555,8 @@ class KubernetesGraphQLAuthorizationMiddleware:
                 existing_filter = getattr(input_obj, "filter", "")
             else:
                 return None
+            if existing_filter is None:
+                existing_filter = ""
             scoped_request = replace(
                 auth_result.request_context,
                 method="GET",
@@ -575,6 +577,10 @@ class KubernetesGraphQLAuthorizationMiddleware:
             try:
                 if isinstance(input_obj, MutableMapping):
                     input_obj["filter"] = narrowed_filter
+                    # Graphene keeps a separate attribute used by MLflow's
+                    # generated resolver when it builds the request from vars().
+                    if hasattr(input_obj, "filter"):
+                        input_obj.filter = narrowed_filter
                 else:
                     input_obj.filter = narrowed_filter
             except (AttributeError, TypeError):
@@ -606,7 +612,7 @@ class KubernetesGraphQLAuthorizationMiddleware:
                         input_obj["experiment_ids"] = readable_ids
                     elif "experimentIds" in input_obj:
                         input_obj["experimentIds"] = readable_ids
-                elif hasattr(input_obj, "experiment_ids"):
+                if hasattr(input_obj, "experiment_ids"):
                     input_obj.experiment_ids = readable_ids
                 elif hasattr(input_obj, "experimentIds"):
                     input_obj.experimentIds = readable_ids

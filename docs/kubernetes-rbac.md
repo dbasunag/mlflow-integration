@@ -124,13 +124,46 @@ When `MLFLOW_K8S_AUTH_AUTHORIZATION_MODE=subject_access_review`, the MLflow serv
 
 That permission is included in [`examples/mlflow-server-rbac.yaml`](../examples/mlflow-server-rbac.yaml).
 
-Named collection scopes are disabled by default in trusted-proxy mode because
-Kubernetes can only perform a `SelfSubjectRulesReview` for the forwarded caller
-by impersonating that caller. To enable them, set
-`MLFLOW_K8S_AUTH_SAR_COLLECTION_SCOPE_DISCOVERY_ENABLED=true` and grant the
-MLflow server's `ClusterRole` `impersonate` on core `users` and `groups`. This is
-a high-trust deployment option: the proxy must authenticate callers and strip
-any client-supplied identity headers before setting the forwarded identity.
+Named collection scopes are enabled by default in trusted-proxy mode. When a
+caller lacks broad collection permission, MLflow impersonates the forwarded user
+and groups only to create a `SelfSubjectRulesReview` (SSRR). SSRR supplies candidate
+resource names; MLflow confirms each name with a SubjectAccessReview before
+narrowing the collection request.
+
+The server ClusterRole in the example manifest and
+[Helm chart](../charts/mlflow/templates/rbac.yaml) includes:
+
+```yaml
+- apiGroups: ["authentication.k8s.io"]
+  resources: ["users", "groups"]
+  verbs: ["impersonate:user-info"]
+- apiGroups: ["authorization.k8s.io"]
+  resources: ["selfsubjectrulesreviews"]
+  verbs: ["impersonate-on:user-info:create"]
+```
+
+This requires Kubernetes 1.35 with the `ConstrainedImpersonation` feature gate
+enabled, or Kubernetes 1.36+, where it is enabled by default. See
+[Kubernetes constrained impersonation](https://kubernetes.io/docs/reference/access-authn-authz/user-impersonation/#constrained-impersonation).
+If the feature is disabled, unavailable, or denied by RBAC, requests requiring
+named-scope discovery are denied before querying MLflow storage. Broadly
+authorized collection requests continue to work without SSRR. Set
+`MLFLOW_K8S_AUTH_SAR_COLLECTION_SCOPE_DISCOVERY_ENABLED=false` to explicitly
+disable discovery in SAR mode.
+
+Do not also grant traditional `impersonate` permission: Kubernetes can fall back
+to it, allowing operations beyond SSRR. Administrators can restrict permitted
+identities by splitting the `users` and `groups` identity rule into separate rules
+and adding `resourceNames` containing the allowed usernames and group names to
+each rule. Every forwarded group must be permitted.
+
+These rules cover ordinary users. Forwarded `system:serviceaccount:` and
+`system:node:` identities require separate constrained impersonation modes and
+are not granted discovery by these rules. Their directly authorized operations
+and broadly authorized collection requests continue to work.
+
+The proxy must authenticate callers and strip client-supplied identity headers
+before setting the forwarded user and groups.
 
 ## Token Creation
 

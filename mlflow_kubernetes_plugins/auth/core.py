@@ -27,8 +27,11 @@ from mlflow_kubernetes_plugins.auth.collection_filters import (
     COLLECTION_POLICY_REQUEST_AUTHORIZED_EXPERIMENT_IDS,
     COLLECTION_POLICY_REQUEST_BATCH_GET_TRACE_INFOS,
     COLLECTION_POLICY_REQUEST_BATCH_GET_TRACES,
+    COLLECTION_POLICY_REQUEST_LIST_SCORERS,
     COLLECTION_POLICY_REQUEST_SEARCH_DATASETS,
     COLLECTION_POLICY_REQUEST_SEARCH_EXPERIMENTS,
+    COLLECTION_POLICY_REQUEST_SEARCH_MODEL_VERSIONS,
+    COLLECTION_POLICY_REQUEST_SEARCH_REGISTERED_MODELS,
     apply_request_collection_filter,
     is_graphql_collection_policy,
 )
@@ -72,6 +75,18 @@ if not hasattr(werkzeug, "__version__"):  # pragma: no cover - compatibility shi
 _logger = logging.getLogger(__name__)
 _AUTHORIZATION_HANDLED: ContextVar[_AuthorizationResult | None] = ContextVar(
     "_AUTHORIZATION_HANDLED", default=None
+)
+_COLLECTION_POLICIES_REQUIRING_REQUEST_BODY = frozenset(
+    {
+        COLLECTION_POLICY_REQUEST_AUTHORIZED_EXPERIMENT_IDS,
+        COLLECTION_POLICY_REQUEST_BATCH_GET_TRACE_INFOS,
+        COLLECTION_POLICY_REQUEST_BATCH_GET_TRACES,
+        COLLECTION_POLICY_REQUEST_LIST_SCORERS,
+        COLLECTION_POLICY_REQUEST_SEARCH_EXPERIMENTS,
+        COLLECTION_POLICY_REQUEST_SEARCH_DATASETS,
+        COLLECTION_POLICY_REQUEST_SEARCH_MODEL_VERSIONS,
+        COLLECTION_POLICY_REQUEST_SEARCH_REGISTERED_MODELS,
+    }
 )
 
 
@@ -586,6 +601,8 @@ async def _enforce_gateway_budget_scope(
 
 async def _ensure_request_context_json_body(
     request_context: AuthorizationRequest,
+    *,
+    allow_get_body: bool = False,
 ) -> AuthorizationRequest:
     """Return an ``AuthorizationRequest`` that has its JSON body loaded.
 
@@ -595,6 +612,8 @@ async def _ensure_request_context_json_body(
     constructed with the loaded ``json_body`` and derived ``graphql_payload``.
     """
     if request_context.json_body is not None or request_context.ensure_json_body is None:
+        return request_context
+    if request_context.method.upper() == "GET" and not allow_get_body:
         return request_context
     loaded_body = await request_context.ensure_json_body()
     return replace(
@@ -817,17 +836,11 @@ async def _authorize_request_async(
                 None,
                 COLLECTION_POLICY_BROAD_ONLY,
             }:
-                if rule.collection_policy in {
-                    COLLECTION_POLICY_REQUEST_AUTHORIZED_EXPERIMENT_IDS,
-                    COLLECTION_POLICY_REQUEST_BATCH_GET_TRACE_INFOS,
-                    COLLECTION_POLICY_REQUEST_BATCH_GET_TRACES,
-                    COLLECTION_POLICY_REQUEST_SEARCH_EXPERIMENTS,
-                    COLLECTION_POLICY_REQUEST_SEARCH_DATASETS,
-                }:
+                if rule.collection_policy in _COLLECTION_POLICIES_REQUIRING_REQUEST_BODY:
                     # Intersect both query and body sources; do not accept a query-only
                     # scope before a possibly conflicting JSON body has been read.
                     updated_request_context = await _ensure_request_context_json_body(
-                        updated_request_context
+                        updated_request_context, allow_get_body=True
                     )
                 updated_request_context, request_filter_applied = apply_request_collection_filter(
                     updated_request_context,
