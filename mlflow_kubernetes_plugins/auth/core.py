@@ -299,6 +299,9 @@ class _AuthorizationResult:
     rules: list[AuthorizationRule]
     request_context: AuthorizationRequest
     username: str | None
+    # Kept for compatibility with callers that inspect the authorization result.
+    # Collection filtering is request-side now, so this remains false.
+    response_filter_required: bool = False
 
     @property
     def token(self) -> str | None:
@@ -707,7 +710,7 @@ async def _authorize_request_async(
             updated_request_context.method == "GET" and updated_request_context.query_params
         ):
             updated_request_context = await _ensure_request_context_json_body(
-                updated_request_context
+                updated_request_context, allow_get_body=True
             )
         # Classify the artifact before granting broad experiment permission.
         rules = skill_artifact_rules(updated_request_context, rules)
