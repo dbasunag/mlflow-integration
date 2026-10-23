@@ -781,9 +781,10 @@ def _filter_request_registered_model_search(
     ), True
 
 
-def _normalize_collection_request(
+def normalize_collection_request(
     request_context: AuthorizationRequest, policy: str
 ) -> tuple[AuthorizationRequest, bool]:
+    """Canonicalize protobuf collection inputs without changing the requested scope."""
     body = request_context.json_body
     if isinstance(body, str):
         # Match MLflow's one additional decode for legacy JSON-string bodies.
@@ -843,7 +844,7 @@ def apply_request_collection_filter(
     """
     if policy in _COLLECTION_REQUEST_MESSAGES:
         assert policy is not None
-        request_context, normalized = _normalize_collection_request(request_context, policy)
+        request_context, normalized = normalize_collection_request(request_context, policy)
         if not normalized:
             return request_context, False
     if policy == COLLECTION_POLICY_REQUEST_EXPERIMENT_IDS:
@@ -930,4 +931,5 @@ __all__ = [
     "filter_readable_run_ids",
     "is_graphql_collection_policy",
     "is_request_filter_policy",
+    "normalize_collection_request",
 ]

@@ -49,7 +49,7 @@ def _scoped_filter(path: str, policy: str, allowed_names: tuple[str, ...]) -> st
     return filter_string
 
 
-def _collect_paginated_names(search_page, name_of) -> list[str]:
+def _collect_paginated_names(search_page, name_of, *, page_size: int) -> list[str]:
     collected: list[str] = []
     page_token = None
     while True:
@@ -58,6 +58,7 @@ def _collect_paginated_names(search_page, name_of) -> list[str]:
         page_token = page.token
         if not page_token:
             return collected
+        assert len(page) == page_size, "Non-final pages must be full."
 
 
 def test_search_evaluation_datasets_scoped_filter_paginates_without_underfill(tmp_path):
@@ -84,6 +85,7 @@ def test_search_evaluation_datasets_scoped_filter_paginates_without_underfill(tm
             filter_string=filter_string, max_results=2, page_token=page_token
         ),
         lambda dataset: dataset.name,
+        page_size=2,
     )
 
     assert sorted(collected) == sorted(allowed_names)
@@ -138,6 +140,7 @@ def test_search_mcp_access_endpoints_scoped_filter_paginates_without_underfill(t
             filter_string=filter_string, max_results=2, page_token=page_token
         ),
         lambda endpoint: endpoint.server_name,
+        page_size=2,
     )
 
     assert sorted(collected) == sorted(allowed_names)

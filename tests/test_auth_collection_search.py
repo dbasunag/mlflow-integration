@@ -298,8 +298,13 @@ def dataset_search_http(tmp_path_factory):
         return original_search(*args, **kwargs)
 
     authorizer = Mock()
-    authorizer.is_allowed.side_effect = lambda identity, *args, **kwargs: (
-        identity.user == "broad-user" or kwargs.get("resource_name") in ("allowed-a", "allowed-b")
+    authorizer.is_allowed.side_effect = lambda identity, resource, verb, *args, **kwargs: (
+        (resource == "experiments" and verb == "get")
+        if identity.user == "broad-get-user"
+        else (
+            identity.user == "broad-user"
+            or kwargs.get("resource_name") in ("allowed-a", "allowed-b")
+        )
     )
     authorizer.discover_collection_scope.return_value = CollectionScope(
         names=("allowed-a", "allowed-b")
@@ -617,6 +622,126 @@ def test_scorer_get_json_body_preserves_selectors(collection_search_http, prefix
     assert sorted(str(row["experiment_id"]) for row in response.json()["scorers"]) == sorted(
         server.experiments[name] for name in expected
     )
+
+
+@pytest.mark.parametrize("prefix", ["/api", "/ajax-api"])
+@pytest.mark.parametrize("source", ["query", "body", "legacy-body"])
+@pytest.mark.parametrize("selector", [None, "experiment_id", "experiment_ids"])
+def test_scorer_broad_get_preserves_cross_experiment_access(
+    collection_search_http, prefix, source, selector
+):
+    server = collection_search_http
+    expected = ("allowed-a", "allowed-b", "forbidden") if selector is None else ("forbidden",)
+    values = {}
+    if selector is not None:
+        experiment_id = server.experiments["forbidden"]
+        values[selector] = [experiment_id] if selector == "experiment_ids" else experiment_id
+    response = server.http.request(
+        "GET",
+        server.static_prefix + prefix + "/3.0/mlflow/scorers/list",
+        headers={"x-remote-user": "broad-get-user"},
+        **(
+            {"params": values}
+            if source == "query"
+            else {"json": json.dumps(values) if source == "legacy-body" else values}
+        ),
+    )
+    assert response.status_code == 200, response.text
+    assert sorted(str(row["experiment_id"]) for row in response.json()["scorers"]) == sorted(
+        server.experiments[name] for name in expected
+    )
+
+
+@pytest.mark.parametrize("prefix", ["/api", "/ajax-api"])
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"experimentIds": []},
+        {"experiment_ids": []},
+        {"experiment_ids": ["1"], "experimentIds": ["2"]},
+        {"experiment_ids": 42},
+    ],
+    ids=["empty-alias", "empty", "conflicting-aliases", "invalid-type"],
+)
+def test_scorer_broad_get_rejects_invalid_body_scope(
+    collection_search_http, monkeypatch, prefix, body
+):
+    from mlflow.server.handlers import _get_tracking_store
+
+    server = collection_search_http
+    list_scorers = Mock(side_effect=AssertionError("Invalid input must not read scorers."))
+    monkeypatch.setattr(_get_tracking_store(), "list_scorers_across_experiments", list_scorers)
+    response = server.http.request(
+        "GET",
+        server.static_prefix + prefix + "/3.0/mlflow/scorers/list",
+        headers={"x-remote-user": "broad-get-user"},
+        json=body,
+    )
+    assert response.status_code == 400, response.text
+    list_scorers.assert_not_called()
+
+
+@pytest.mark.parametrize("prefix", ["/api", "/ajax-api"])
+def test_scorer_broad_get_normalizes_plural_body_alias(collection_search_http, prefix):
+    server = collection_search_http
+    response = server.http.request(
+        "GET",
+        server.static_prefix + prefix + "/3.0/mlflow/scorers/list",
+        headers={"x-remote-user": "broad-get-user"},
+        json={"experimentIds": [server.experiments["forbidden"]]},
+    )
+    assert response.status_code == 200, response.text
+    assert [str(row["experiment_id"]) for row in response.json()["scorers"]] == [
+        server.experiments["forbidden"]
+    ]
+
+
+@pytest.mark.parametrize("prefix", ["/api", "/ajax-api"])
+def test_scorer_broad_get_prefers_query_over_body(collection_search_http, prefix):
+    server = collection_search_http
+    response = server.http.request(
+        "GET",
+        server.static_prefix + prefix + "/3.0/mlflow/scorers/list",
+        headers={"x-remote-user": "broad-get-user"},
+        params={"experiment_ids": [server.experiments["forbidden"]]},
+        json={"experiment_ids": [server.experiments["allowed-a"]]},
+    )
+    assert response.status_code == 200, response.text
+    assert [str(row["experiment_id"]) for row in response.json()["scorers"]] == [
+        server.experiments["forbidden"]
+    ]
+
+
+@pytest.mark.parametrize("prefix", ["/api", "/ajax-api"])
+def test_warm_scorer_scope_drops_renamed_experiment(collection_search_http, prefix):
+    server = collection_search_http
+    path = server.static_prefix + prefix + "/3.0/mlflow/scorers/list"
+    expected = {server.experiments[name] for name in ("allowed-a", "allowed-b")}
+    for _ in range(2):
+        response = server.http.get(path, headers={"x-remote-user": "alice"})
+        assert response.status_code == 200, response.text
+        assert {str(row["experiment_id"]) for row in response.json()["scorers"]} == expected
+
+    update_path = server.static_prefix + prefix + "/2.0/mlflow/experiments/update"
+    try:
+        response = server.http.post(
+            update_path,
+            headers={"x-remote-user": "broad-user"},
+            json={"experiment_id": server.experiments["allowed-a"], "new_name": "private-renamed"},
+        )
+        assert response.status_code == 200, response.text
+        response = server.http.get(path, headers={"x-remote-user": "alice"})
+        assert response.status_code == 200, response.text
+        assert {str(row["experiment_id"]) for row in response.json()["scorers"]} == {
+            server.experiments["allowed-b"]
+        }
+    finally:
+        response = server.http.post(
+            update_path,
+            headers={"x-remote-user": "broad-user"},
+            json={"experiment_id": server.experiments["allowed-a"], "new_name": "allowed-a"},
+        )
+        assert response.status_code == 200, response.text
 
 
 @pytest.mark.parametrize("prefix", ["/api", "/ajax-api"])

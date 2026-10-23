@@ -69,7 +69,8 @@ This is most useful for single-object operations such as:
 - creating or updating model versions, webhooks, and many gateway resources by name
 - reading artifacts or trace details that resolve back to one experiment
 
-Collection searches first check broad `list` permission in the workspace. An
+Collection searches first check broad `list` permission in the workspace, except
+scorer listing, which retains its existing broad experiment `get` requirement. An
 explicit `resourceNames: ["*"]` grant on `get` or `list` is a plugin-level
 compatibility convention and also permits the original query; Kubernetes RBAC
 does not interpret that name as a wildcard itself. Otherwise, the plugin
@@ -85,6 +86,22 @@ scorer listing; and GraphQL model-version search. REST and AJAX variants use the
 same rules. Collection responses are not filtered or backfilled after the query.
 Other collection endpoints that already narrow explicit request IDs retain their
 request-side authorization behavior.
+
+For scorer listing, broad experiment `get` permits both cross-experiment and
+explicit experiment selections without permission discovery. Callers with only
+concrete named experiment `get` grants still have their requests constrained to
+those experiments before storage is queried.
+Scorer selectors in GET JSON bodies are normalized to query parameters even for
+broadly authorized callers. An explicitly empty `experiment_ids` body selector
+is rejected with `INVALID_PARAMETER_VALUE` rather than treated as an unscoped query.
+
+Experiment name-to-ID lookups are cached per workspace for up to 60 seconds, with
+a limit of 4,096 entries per server process. Successful experiment renames and
+deletions through that process clear the reverse lookup cache. Missing names and
+failed lookups are not cached. Changes made outside that process, including
+through another server worker, can leave an old mapping usable until its TTL
+expires; cache hits do not extend that TTL. Kubernetes permission decisions and
+discovered grants retain their separately configured authorization cache TTL.
 
 Use the example manifest below as a starting point for both broad workspace access and name-scoped experiment access:
 

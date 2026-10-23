@@ -34,6 +34,7 @@ from mlflow_kubernetes_plugins.auth.collection_filters import (
     COLLECTION_POLICY_REQUEST_SEARCH_REGISTERED_MODELS,
     apply_request_collection_filter,
     is_graphql_collection_policy,
+    normalize_collection_request,
 )
 from mlflow_kubernetes_plugins.auth.constants import (
     DEFAULT_REMOTE_GROUPS_SEPARATOR,
@@ -782,6 +783,30 @@ async def _authorize_request_async(
                 rule.subresource,
             )
             has_broad_permission = has_permission
+            if (
+                has_permission
+                and rule.collection_policy == COLLECTION_POLICY_REQUEST_LIST_SCORERS
+                and not updated_request_context.query_params
+            ):
+                # MLflow parses GET bodies, but checks the query string for the
+                # presence of experiment_ids. Preserve that selector even when
+                # broad get permission skips named-scope discovery.
+                updated_request_context = await _ensure_request_context_json_body(
+                    updated_request_context, allow_get_body=True
+                )
+                updated_request_context, normalized = normalize_collection_request(
+                    updated_request_context, rule.collection_policy
+                )
+                if (
+                    not normalized
+                    or updated_request_context.query_params.get("experiment_ids") == []
+                ):
+                    # Empty repeated fields disappear when encoded as a query;
+                    # reject them rather than accidentally listing all scorers.
+                    raise MlflowException(
+                        "Invalid scorer collection input; experiment_ids must be nonempty if set.",
+                        error_code=databricks_pb2.INVALID_PARAMETER_VALUE,
+                    )
             response_or_graphql_filter_policy = is_graphql_collection_policy(rule.collection_policy)
             hybrid_missing_reference_filter_rule = (
                 rule.resource_name_parsers

@@ -574,7 +574,7 @@ BASE_REQUEST_AUTHORIZATION_RULES: dict[type, AuthorizationRule | tuple[Authoriza
         resource_name_parsers=(RESOURCE_NAME_PARSER_MODEL_ID_TO_EXPERIMENT_NAME,),
     ),
     ListScorers: _experiments_rule(
-        "list",
+        "get",
         collection_policy=COLLECTION_POLICY_REQUEST_LIST_SCORERS,
     ),
     GetScorer: _experiments_rule(

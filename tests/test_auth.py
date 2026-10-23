@@ -3361,7 +3361,7 @@ def test_mlflow_313_request_authorization_rules_cover_cross_experiment_list_scor
         pytest.skip("Installed MLflow version does not expose the 3.13 scorer-list behavior.")
 
     assert REQUEST_AUTHORIZATION_RULES[ListScorers] == AuthorizationRule(
-        "list",
+        "get",
         resource=RESOURCE_EXPERIMENTS,
         collection_policy=COLLECTION_POLICY_REQUEST_LIST_SCORERS,
     )
@@ -4807,7 +4807,8 @@ def test_resolve_experiment_ids_from_names_uses_exact_store_lookup(
         "exp-b",
     ]
     assert resolve_experiment_ids_from_names(("exp-a", "exp-b", "exp-a")) == ("1",)
-    assert store.get_experiment_by_name.call_count == 4
+    # Successful lookups are reused; missing names are looked up again.
+    assert store.get_experiment_by_name.call_count == 3
 
 
 def test_search_experiments_single_name_scopes_before_response():
@@ -5134,20 +5135,23 @@ def test_list_scorers_rule_supports_named_scope():
         pytest.skip("Installed MLflow version does not expose the 3.13 scorer-list behavior.")
 
     rule = REQUEST_AUTHORIZATION_RULES[ListScorers]
-    assert rule.verb == "list"
+    assert rule.verb == "get"
     assert rule.collection_policy == COLLECTION_POLICY_REQUEST_LIST_SCORERS
 
 
 @pytest.mark.parametrize("prefix", ["/api", "/ajax-api"])
-def test_list_scorers_broad_list_permission_skips_scope_discovery(prefix, compile_auth_rules):
+@pytest.mark.parametrize(
+    "query", [{}, {"experiment_id": "1"}, {"experiment_ids": "1"}, {"experiment_ids": ["1", "2"]}]
+)
+def test_list_scorers_broad_get_permission_skips_scope_discovery(prefix, query, compile_auth_rules):
     path = f"{prefix}/3.0/mlflow/scorers/list"
     compile_auth_rules([(path, ListScorers, ["GET"])])
     authorizer = Mock()
     authorizer.is_allowed.side_effect = lambda identity, resource, verb, namespace, subresource: (
-        resource == RESOURCE_EXPERIMENTS and verb == "list"
+        resource == RESOURCE_EXPERIMENTS and verb == "get"
     )
     authorizer.discover_collection_scope.side_effect = AssertionError(
-        "Broad list access must not require scope discovery."
+        "Broad get access must not require scope discovery."
     )
     context = AuthorizationRequest(
         authorization_header="Bearer scorer-token",
@@ -5157,17 +5161,62 @@ def test_list_scorers_broad_list_permission_skips_scope_discovery(prefix, compil
         path=path,
         method="GET",
         workspace="team-a",
+        query_params=query,
     )
 
     result = _authorize_request(
         context, authorizer=authorizer, config_values=KubernetesAuthConfig()
     )
 
-    assert result.request_context.query_params == {}
+    assert result.request_context.query_params == query
     authorizer.is_allowed.assert_called_once_with(
-        result.identity, RESOURCE_EXPERIMENTS, "list", "team-a", None
+        result.identity, RESOURCE_EXPERIMENTS, "get", "team-a", None
     )
     authorizer.discover_collection_scope.assert_not_called()
+
+
+@pytest.mark.parametrize("prefix", ["/api", "/ajax-api"])
+@pytest.mark.parametrize(
+    ("names", "requested_ids", "expected_ids"),
+    [
+        (("exp-a",), None, ["1"]),
+        (("exp-a",), ["1", "2"], ["1"]),
+        (("exp-a",), ["2"], None),
+        ((), None, None),
+    ],
+)
+def test_list_scorers_without_broad_get_enforces_scope(
+    monkeypatch, compile_auth_rules, prefix, names, requested_ids, expected_ids
+):
+    path = f"{prefix}/3.0/mlflow/scorers/list"
+    compile_auth_rules([(path, ListScorers, ["GET"])])
+    monkeypatch.setattr(
+        "mlflow_kubernetes_plugins.auth.collection_filters.resolve_experiment_ids_from_names",
+        lambda names: ("1",),
+    )
+    authorizer = Mock()
+    authorizer.is_allowed.return_value = False
+    authorizer.discover_collection_scope.return_value = CollectionScope(names=names)
+    context = AuthorizationRequest(
+        authorization_header="Bearer scorer-token",
+        forwarded_access_token=None,
+        remote_user_header_value=None,
+        remote_groups_header_value=None,
+        path=path,
+        method="GET",
+        workspace="team-a",
+        query_params={} if requested_ids is None else {"experiment_ids": requested_ids},
+    )
+
+    if expected_ids is None:
+        with pytest.raises(MlflowException) as exc:
+            _authorize_request(context, authorizer=authorizer, config_values=KubernetesAuthConfig())
+        assert exc.value.error_code == "PERMISSION_DENIED"
+    else:
+        result = _authorize_request(
+            context, authorizer=authorizer, config_values=KubernetesAuthConfig()
+        )
+        assert result.request_context.query_params == {"experiment_ids": expected_ids}
 
 
 def test_list_scorers_single_experiment_uses_named_get(monkeypatch):
