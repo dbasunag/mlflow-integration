@@ -71,6 +71,7 @@ from mlflow_kubernetes_plugins.auth._compat import (
     HAS_MLFLOW_3_14_AUTH_SURFACE,
     HAS_MLFLOW_3_15_AUTH_SURFACE,
     HAS_MLFLOW_3_16_AUTH_SURFACE,
+    HAS_MLFLOW_3_17_AUTH_SURFACE,
     AddGuardrailToEndpoint,
     AddItemsToReviewQueue,
     BatchGetTraceInfos,
@@ -120,6 +121,7 @@ from mlflow_kubernetes_plugins.auth.authorizer import (
     _CacheEntry,
 )
 from mlflow_kubernetes_plugins.auth.collection_filters import (
+    COLLECTION_POLICY_BROAD_ONLY,
     COLLECTION_POLICY_REQUEST_EXPERIMENT_ID,
     COLLECTION_POLICY_REQUEST_EXPERIMENT_IDS,
     COLLECTION_POLICY_REQUEST_RUN_IDS,
@@ -3422,6 +3424,24 @@ def test_mlflow_316_assistant_tool_result_authorization():
     ] == AuthorizationRule("update", resource=RESOURCE_ASSISTANTS)
 
 
+def test_mlflow_317_gateway_authorization():
+    if not HAS_MLFLOW_3_17_AUTH_SURFACE:
+        pytest.skip("Installed MLflow version does not expose the 3.17 gateway routes.")
+
+    assert PATH_AUTHORIZATION_RULES[("/gateway/mlflow/v1/models", "GET")] == AuthorizationRule(
+        "list", resource=RESOURCE_GATEWAY_ENDPOINTS, collection_policy=COLLECTION_POLICY_BROAD_ONLY
+    )
+    assert PATH_AUTHORIZATION_RULES[
+        ("/gateway/typesafe/v1/systemone", "POST")
+    ] == AuthorizationRule(
+        "create",
+        resource=RESOURCE_GATEWAY_ENDPOINTS,
+        subresource="use",
+        resource_name_parsers=(RESOURCE_NAME_PARSER_GATEWAY_PROXY_ENDPOINT_NAME,),
+    )
+
+
+
 def test_mlflow_prefixed_custom_path_authorization_rules_are_registered():
     get_job_rule = PATH_AUTHORIZATION_RULES[("/ajax-api/3.0/mlflow/jobs/<job_id>", "GET")]
     cancel_job_rule = PATH_AUTHORIZATION_RULES[
@@ -5169,6 +5189,8 @@ def test_gateway_proxy_post_routes_use_endpoint_name_parser():
         routes.append(("/gateway/proxy/<endpoint_name>/<path:path>", "POST"))
     if HAS_MLFLOW_3_14_AUTH_SURFACE:
         routes.append(("/gateway/openai/v1/responses/compact", "POST"))
+    if HAS_MLFLOW_3_17_AUTH_SURFACE:
+        routes.append(("/gateway/typesafe/v1/systemone", "POST"))
 
     for route in routes:
         rule = PATH_AUTHORIZATION_RULES[route]
