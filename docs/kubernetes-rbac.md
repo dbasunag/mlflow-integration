@@ -88,7 +88,11 @@ The [versioned endpoint inventory](authorization-collections-v1.md) records the 
 including hybrid scorer behavior and workspace-scoped exceptions.
 
 These policies are endpoint-specific. Dataset-input search uses `datasets:list` with
-experiment-based request narrowing.
+experiment-based request narrowing. Evaluation-dataset search responses retain a dataset only
+when the caller can read every associated experiment. The existing filter accepts plural
+`experiment_ids`/`experimentIds` and legacy singular `experiment_id`/`experimentId` fields.
+Datasets with missing, malformed, unresolved, or unreadable experiment associations are omitted.
+Broad `datasets:list` continues to bypass response filtering.
 Existing broad-only collections, including gateway listings and webhook listings, continue
 to require broad `list` permission.
 

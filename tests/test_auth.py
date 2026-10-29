@@ -4540,16 +4540,71 @@ def test_existing_collection_named_get_filtering_is_preserved(
     assert filtered == {key: [visible]}
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="Existing v1 dataset-summary filter reads singular experiment_id, but evaluation "
-    "datasets expose plural experiment_ids; no new response filtering is added by this backport.",
+@pytest.mark.parametrize("preserve_proto_field_names", [False, True])
+@pytest.mark.parametrize(
+    ("readable_names", "expected_names"),
+    [
+        ({"exp-a"}, ["visible"]),
+        ({"exp-b"}, ["hidden"]),
+        ({"exp-a", "exp-b"}, ["visible", "shared", "hidden"]),
+        (set(), []),
+    ],
 )
-def test_evaluation_dataset_named_get_filtering_uses_real_response(monkeypatch):
-    response = SearchEvaluationDatasets.Response()
+def test_evaluation_dataset_named_get_filtering_uses_real_response(
+    monkeypatch, preserve_proto_field_names, readable_names, expected_names
+):
+    response = SearchEvaluationDatasets.Response(next_page_token="next-page")
     response.datasets.add(dataset_id="visible", name="visible", experiment_ids=["1"])
+    response.datasets.add(dataset_id="shared", name="shared", experiment_ids=["1", "2"])
     response.datasets.add(dataset_id="hidden", name="hidden", experiment_ids=["2"])
-    payload = MessageToDict(response, preserving_proto_field_name=True)
+    response.datasets.add(dataset_id="unlinked", name="unlinked")
+    response.datasets.add(dataset_id="unresolved", name="unresolved", experiment_ids=["missing"])
+    payload = MessageToDict(response, preserving_proto_field_name=preserve_proto_field_names)
+
+    def resolve_experiment_name(experiment_id):
+        if experiment_id == "missing":
+            raise ResourceNameResolutionError("Experiment not found.")
+        return {"1": "exp-a", "2": "exp-b"}[experiment_id]
+
+    monkeypatch.setattr(
+        "mlflow_kubernetes_plugins.auth.collection_filters._resolve_experiment_name_from_experiment_id",
+        resolve_experiment_name,
+    )
+    authorizer = Mock()
+    authorizer.is_allowed.side_effect = lambda *args, **kwargs: (
+        args[1:4] == (RESOURCE_EXPERIMENTS, "get", "team-a")
+        and kwargs.get("resource_name") in readable_names
+    )
+    filtered, enforceable = apply_response_collection_filters(
+        payload,
+        [REQUEST_AUTHORIZATION_RULES[SearchEvaluationDatasets]],
+        authorizer=authorizer,
+        identity=_RequestIdentity(token="filter-token"),
+        workspace_name="team-a",
+    )
+    assert enforceable is True
+    assert filtered == {
+        **payload,
+        "datasets": [
+            dataset for dataset in payload["datasets"] if dataset["name"] in expected_names
+        ],
+    }
+    assert len(payload["datasets"]) == 5
+
+
+@pytest.mark.parametrize("payload_key", ["datasets", "dataset_summaries"])
+@pytest.mark.parametrize(
+    "id_key", ["experiment_id", "experimentId", "experiment_ids", "experimentIds"]
+)
+@pytest.mark.parametrize("numeric_ids", [False, True])
+def test_dataset_summary_filter_preserves_response_formats(
+    monkeypatch, payload_key, id_key, numeric_ids
+):
+    visible_id, hidden_id = (1, 2) if numeric_ids else ("1", "2")
+    if id_key in {"experiment_ids", "experimentIds"}:
+        visible_id, hidden_id = [visible_id], [hidden_id]
+    visible = {"name": "visible", id_key: visible_id}
+    hidden = {"name": "hidden", id_key: hidden_id}
     monkeypatch.setattr(
         "mlflow_kubernetes_plugins.auth.collection_filters._resolve_experiment_name_from_experiment_id",
         lambda experiment_id: {"1": "exp-a", "2": "exp-b"}[experiment_id],
@@ -4560,14 +4615,63 @@ def test_evaluation_dataset_named_get_filtering_uses_real_response(monkeypatch):
         and kwargs.get("resource_name") == "exp-a"
     )
     filtered, enforceable = apply_response_collection_filters(
-        payload,
+        {payload_key: [visible, hidden]},
         [REQUEST_AUTHORIZATION_RULES[SearchEvaluationDatasets]],
         authorizer=authorizer,
         identity=_RequestIdentity(token="filter-token"),
         workspace_name="team-a",
     )
     assert enforceable is True
-    assert filtered == {"datasets": [payload["datasets"][0]]}
+    assert filtered == {payload_key: [visible]}
+
+
+@pytest.mark.parametrize(
+    "summary",
+    [
+        None,
+        "invalid",
+        {},
+        {"experiment_ids": []},
+        {"experiment_ids": None},
+        {"experiment_ids": "1"},
+        {"experiment_ids": {"1": True}},
+        {"experiment_ids": [True]},
+        {"experiment_ids": [1.0]},
+        {"experiment_ids": [""]},
+        {"experiment_ids": [" "]},
+        {"experiment_ids": ["1", None]},
+        {"experiment_ids": ["1", "2"]},
+        {"experiment_ids": ["1", "missing"]},
+        {"experiment_ids": ["1"], "experimentId": "2"},
+        {"experiment_ids": ["1"], "experimentIds": ["2"]},
+        {"experiment_ids": [], "experiment_id": "1"},
+        {"experiment_ids": "1", "experiment_id": "1"},
+        {"experiment_id": "1", "experimentId": "2"},
+    ],
+)
+def test_dataset_summary_filter_denies_incomplete_or_unreadable_identity(monkeypatch, summary):
+    def resolve_experiment_name(experiment_id):
+        if experiment_id == "missing":
+            raise ResourceNameResolutionError("Experiment not found.")
+        return {"1": "exp-a", "2": "exp-b"}[experiment_id]
+
+    monkeypatch.setattr(
+        "mlflow_kubernetes_plugins.auth.collection_filters._resolve_experiment_name_from_experiment_id",
+        resolve_experiment_name,
+    )
+    authorizer = Mock()
+    authorizer.is_allowed.side_effect = lambda *args, **kwargs: (
+        kwargs.get("resource_name") == "exp-a"
+    )
+    filtered, enforceable = apply_response_collection_filters(
+        {"datasets": [summary]},
+        [REQUEST_AUTHORIZATION_RULES[SearchEvaluationDatasets]],
+        authorizer=authorizer,
+        identity=_RequestIdentity(token="filter-token"),
+        workspace_name="team-a",
+    )
+    assert enforceable is True
+    assert filtered == {"datasets": []}
 
 
 def test_apply_response_collection_filters_filters_mcp_servers():

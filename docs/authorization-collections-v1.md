@@ -117,10 +117,25 @@ share route discovery, using effective route contexts on newer FastAPI and flatt
 on older releases. Existing negative FastAPI and protobuf coverage tests remain in the suite.
 
 Existing experiment, registered-model, model-version, trace, MCP, scorer, request-narrowing,
-and query-driven GraphQL regressions remain covered by the full test suite.
+and query-driven GraphQL regressions remain covered by the full test suite. A follow-up repair
+corrects the existing evaluation-dataset filter to read the actual plural `experiment_ids`
+field while retaining legacy singular IDs, snake_case/camelCase fields, and numeric IDs.
+Shared datasets require read permission on every associated experiment; missing, malformed,
+unresolved, and unreadable associations fail closed. Real serialized
+`SearchEvaluationDatasets.Response` tests and registered-handler HTTP regressions cover both
+API aliases, GET/POST, authorization modes, pagination metadata, and the broad-list bypass.
+The former expected-failure test now passes. This fixes an existing filter; it adds no new
+collection policy or response filter.
 
 The released 3.17 tests exercise gateway discovery with broad list, broad get, named get,
 named list, and no grants, plus namespace isolation. TypeSafe tests cover broad and named
 endpoint-use grants and reject unrelated permissions. Both authorization modes are covered.
 The supported CI matrix covers Python 3.12–3.14 with its existing exclusion, and separate
 static-prefix runs cover every supported MLflow minor.
+
+Local validation of this scope on Python 3.12.10 passed the full suite with released MLflow
+3.10.1 (493 passed), 3.16.1 (511 passed), and 3.17.2 (534 passed). Static-prefix runs also
+passed on 3.16.1 and 3.17.2. Development dependency sync, lint, pre-commit, and source/wheel
+builds passed. Type checking reports the same 22 diagnostics as the pre-change commit,
+with no new diagnostics. Python 3.13/3.14 remain covered by the configured CI matrix;
+those versions were not tested locally for this scope change.

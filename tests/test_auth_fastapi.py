@@ -15,7 +15,11 @@ from flask import Flask
 from flask import request as flask_request
 from mlflow.exceptions import MlflowException
 from mlflow.protos import databricks_pb2
-from mlflow.protos.service_pb2 import GetGatewayEndpoint, ListGatewayEndpoints
+from mlflow.protos.service_pb2 import (
+    GetGatewayEndpoint,
+    ListGatewayEndpoints,
+    SearchEvaluationDatasets,
+)
 from mlflow.server.handlers import STATIC_PREFIX_ENV_VAR, get_endpoints
 from mlflow.tracing.utils.otlp import OTLP_TRACES_PATH
 from mlflow.utils import workspace_context
@@ -37,6 +41,7 @@ from mlflow_kubernetes_plugins.auth.constants import (
     DEFAULT_REMOTE_GROUPS_HEADER,
     DEFAULT_REMOTE_GROUPS_SEPARATOR,
     DEFAULT_REMOTE_USER_HEADER,
+    RESOURCE_DATASETS,
     RESOURCE_GATEWAY_ENDPOINTS,
     RESOURCE_MCP_SERVERS,
 )
@@ -1215,6 +1220,101 @@ def test_fastapi_response_collection_filter_applies_to_experiments(
 
     assert response.status_code == 200
     assert response.json()["experiments"] == [{"experiment_id": "1", "name": "exp-a"}]
+
+
+@pytest.mark.parametrize("mode", list(AuthorizationMode))
+@pytest.mark.parametrize("alias", ["/api/", "/ajax-api/"])
+@pytest.mark.parametrize("method", ["GET", "POST"])
+@pytest.mark.parametrize(
+    ("grant", "expected_names"),
+    [
+        ("named-get", ["visible"]),
+        ("both-named-get", ["visible", "shared", "hidden"]),
+        ("none", []),
+        ("broad-list", ["visible", "shared", "hidden", "unlinked"]),
+    ],
+)
+def test_evaluation_dataset_filter_with_registered_handler(
+    monkeypatch, compile_auth_rules, mode, alias, method, grant, expected_names
+):
+    from mlflow.server import handlers
+    from mlflow.store.entities import PagedList
+
+    path = next(
+        path
+        for path, request_class, methods in get_endpoints(lambda request_class: request_class)
+        if request_class is SearchEvaluationDatasets
+        and method in methods
+        and _canonicalize_path(raw_path=path).startswith(alias)
+    )
+    compile_auth_rules([(path, SearchEvaluationDatasets, [method])])
+    records = SearchEvaluationDatasets.Response()
+    records.datasets.add(dataset_id="visible", name="visible", experiment_ids=["1"])
+    records.datasets.add(dataset_id="shared", name="shared", experiment_ids=["1", "2"])
+    records.datasets.add(dataset_id="hidden", name="hidden", experiment_ids=["2"])
+    records.datasets.add(dataset_id="unlinked", name="unlinked")
+    store = Mock()
+    store.search_datasets.return_value = PagedList(
+        [SimpleNamespace(to_proto=lambda record=record: record) for record in records.datasets],
+        token="next-page",
+    )
+    monkeypatch.setattr(handlers, "_get_tracking_store", lambda: store)
+    monkeypatch.setattr(
+        "mlflow_kubernetes_plugins.auth.collection_filters._resolve_experiment_name_from_experiment_id",
+        lambda experiment_id: {"1": "exp-a", "2": "exp-b"}[experiment_id],
+    )
+    authorizer = Mock(spec=KubernetesAuthorizer)
+
+    def is_allowed(identity, resource, verb, namespace, subresource=None, resource_name=None):
+        assert namespace == "team-a"
+        if resource == RESOURCE_DATASETS and verb == "list" and resource_name is None:
+            return grant == "broad-list"
+        return (
+            resource == "experiments"
+            and verb == "get"
+            and (
+                (grant == "named-get" and resource_name == "exp-a")
+                or (grant == "both-named-get" and resource_name in {"exp-a", "exp-b"})
+            )
+        )
+
+    authorizer.is_allowed.side_effect = is_allowed
+    flask_app = Flask(__name__)
+    flask_app.add_url_rule(
+        path,
+        "search_evaluation_datasets",
+        handlers.get_handler(SearchEvaluationDatasets),
+        methods=[method],
+    )
+    app = FastAPI()
+    app.mount("/", WSGIMiddleware(flask_app))
+    app.add_middleware(
+        KubernetesAuthMiddleware,
+        authorizer=authorizer,
+        config_values=KubernetesAuthConfig(authorization_mode=mode),
+    )
+    monkeypatch.setattr(
+        "mlflow_kubernetes_plugins.auth.middleware.resolve_workspace_from_header",
+        lambda name: SimpleNamespace(name=name),
+    )
+    headers = {
+        "Authorization": "Bearer dataset-token",
+        DEFAULT_REMOTE_USER_HEADER: "alice",
+        WORKSPACE_HEADER_NAME: "team-a",
+    }
+    with TestClient(app) as client:
+        response = client.request(
+            method, path, headers=headers, **({"json": {}} if method == "POST" else {})
+        )
+    assert response.status_code == 200
+    assert [dataset["name"] for dataset in response.json()["datasets"]] == expected_names
+    assert response.json()["next_page_token"] == "next-page"
+    store.search_datasets.assert_called_once()
+    assert store.search_datasets.call_args.kwargs["experiment_ids"] is None
+    if grant == "broad-list":
+        assert all(
+            call.args[1] == RESOURCE_DATASETS for call in authorizer.is_allowed.call_args_list
+        )
 
 
 def test_fastapi_filters_mounted_flask_workspace_lists(
