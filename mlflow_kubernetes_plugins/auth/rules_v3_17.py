@@ -21,7 +21,7 @@ def apply_v3_17_deltas(
 ) -> None:
     path_authorization_rules.update(
         {
-            # This lists gateway endpoint names, matching ListGatewayEndpoints permissions.
+            # Discovery returns every endpoint name in the workspace, without response filtering.
             ("/gateway/mlflow/v1/models", "GET"): _gateway_endpoints_rule(
                 "list", collection_policy=COLLECTION_POLICY_BROAD_ONLY
             ),

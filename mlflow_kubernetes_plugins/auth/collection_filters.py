@@ -24,6 +24,9 @@ if TYPE_CHECKING:
     from mlflow_kubernetes_plugins.auth.rules import AuthorizationRule
 
 
+# Default for workspace-wide collections of new resource types on release-v1: require an
+# unnamed list review. This marker deliberately enables no request/response filter fallback.
+# Keep existing filtered and parent-scoped collections on their explicit policies.
 COLLECTION_POLICY_BROAD_ONLY = "broad_only"
 COLLECTION_POLICY_GRAPHQL_FILTER = "graphql_filter"
 COLLECTION_POLICY_REQUEST_EXPERIMENT_IDS = "request_filter_experiment_ids"
